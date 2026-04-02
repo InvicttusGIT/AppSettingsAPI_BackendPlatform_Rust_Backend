@@ -67,7 +67,9 @@ impl AppSettingsMetrics {
                 return;
             }
         }
-        let mut m = match self.inner.lock() {
+        // Never block the request path on metrics.
+        // Under extreme concurrency, dropping samples is better than increasing tail latency.
+        let mut m = match self.inner.try_lock() {
             Ok(v) => v,
             Err(_) => return,
         };

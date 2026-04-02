@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use redis::AsyncCommands;
+use deadpool_redis::redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 
 use crate::models::AppSettingsResponse;
@@ -32,7 +32,7 @@ struct CacheEnvelope {
 
 #[derive(Clone)]
 pub struct TwoLevelCache {
-    redis: redis::Client,
+    redis_pool: deadpool_redis::Pool,
     l1: DashMap<String, CacheEnvelope>,
     l1_enabled: bool,
     l1_max_keys: usize,
@@ -43,7 +43,7 @@ pub struct TwoLevelCache {
 
 impl TwoLevelCache {
     pub fn new(
-        redis: redis::Client,
+        redis_pool: deadpool_redis::Pool,
         l1_enabled: bool,
         l1_max_keys: usize,
         ttl: Duration,
@@ -51,7 +51,7 @@ impl TwoLevelCache {
         negative_ttl: Duration,
     ) -> Self {
         Self {
-            redis,
+            redis_pool,
             l1: DashMap::new(),
             l1_enabled,
             l1_max_keys,
@@ -87,7 +87,7 @@ impl TwoLevelCache {
             }
         }
 
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.redis_pool.get().await?;
         let raw: Option<String> = conn.get(key).await?;
         let Some(raw) = raw else {
             return Ok(CacheResult { value: None, state: CacheState::Miss, not_found: false });
@@ -125,7 +125,7 @@ impl TwoLevelCache {
     async fn set_envelope(&self, key: &str, env: CacheEnvelope) -> anyhow::Result<()> {
         let ttl_secs = ((env.stale_until_ms - now_ms()) / 1000).max(1) as u64;
         let payload = serde_json::to_string(&env)?;
-        let mut conn = self.redis.get_multiplexed_async_connection().await?;
+        let mut conn = self.redis_pool.get().await?;
         let _: () = conn.set_ex(key, payload, ttl_secs).await?;
         if self.l1_enabled {
             if self.l1.len() > self.l1_max_keys {

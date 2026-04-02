@@ -36,7 +36,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg = AppConfig::from_env()?;
     info!("Starting BackendPlatform_Rust_API env={} addr={}", cfg.env, cfg.listen_addr);
 
-    let redis_client = redis::Client::open(cfg.redis_url.clone())?;
+    let mut redis_cfg = deadpool_redis::Config::from_url(cfg.redis_url.clone());
+    redis_cfg.pool = Some(deadpool::managed::PoolConfig {
+        max_size: cfg.redis_pool_size,
+        ..Default::default()
+    });
+    let redis_pool = redis_cfg
+        .create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
     let backend_client = BackendClient::new(cfg.backend_base_url.clone(), cfg.request_timeout)?;
     let metrics = AppSettingsMetrics::new(cfg.metrics_sample_rate);
 
@@ -74,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let cache = Arc::new(TwoLevelCache::new(
-        redis_client,
+        redis_pool,
         cfg.mem_cache_enabled,
         cfg.mem_cache_max_keys,
         effective_ttl,

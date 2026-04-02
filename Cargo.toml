@@ -22,4 +22,7 @@ anyhow = "1.0"
 dashmap = "6.1"
 maxminddb = "0.24"
 hdrhistogram = "7.5"
+deadpool-redis = "0.23.0"
+deadpool = "0.13.0"
+deadpool-runtime = "0.3.1"
 
