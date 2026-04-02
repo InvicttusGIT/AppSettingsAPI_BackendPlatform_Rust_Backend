@@ -1,8 +1,15 @@
-use std::{net::IpAddr, str::FromStr, sync::Arc, time::{Duration, Instant}};
+use std::{
+    net::IpAddr,
+    str::FromStr,
+    sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
 
 use axum::http::HeaderMap;
+use dashmap::DashMap;
 use thiserror::Error;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tracing::info;
 
 use crate::{
@@ -33,6 +40,11 @@ pub struct AppSettingsService {
     fallback_country_code: String,
     geoip: Option<Arc<dyn GeoIpService>>,
     metrics: AppSettingsMetrics,
+    in_flight: Arc<DashMap<String, Arc<Notify>>>,
+    log_slow_ms: u128,
+    log_sample_rate: u64,
+    log_table_enabled: bool,
+    log_counter: Arc<AtomicU64>,
 }
 
 impl AppSettingsService {
@@ -43,6 +55,9 @@ impl AppSettingsService {
         fallback_country_code: String,
         geoip: Option<Arc<dyn GeoIpService>>,
         metrics: AppSettingsMetrics,
+        log_slow_ms: u128,
+        log_sample_rate: u64,
+        log_table_enabled: bool,
     ) -> Self {
         Self {
             cache,
@@ -51,7 +66,26 @@ impl AppSettingsService {
             fallback_country_code,
             geoip,
             metrics,
+            in_flight: Arc::new(DashMap::new()),
+            log_slow_ms,
+            log_sample_rate: log_sample_rate.max(1),
+            log_table_enabled,
+            log_counter: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    #[inline]
+    pub fn should_log_start(&self) -> bool {
+        if self.log_sample_rate <= 1 {
+            return true;
+        }
+        let n = self.log_counter.fetch_add(1, Ordering::Relaxed);
+        n % self.log_sample_rate == 0
+    }
+
+    #[inline]
+    pub fn should_log_end(&self, sampled: bool, total_ms: u128) -> bool {
+        sampled || total_ms >= self.log_slow_ms
     }
 
     pub async fn get(
@@ -64,7 +98,219 @@ impl AppSettingsService {
         secret_key: &str,
     ) -> Result<AppSettingsResponse, ServiceError> {
         let t0 = Instant::now();
-        let emit_table = |outcome: &str, country: &Option<String>, cache_state: CacheState, cache_ms: u128, backend_ms: u128, total_ms: u128| {
+        let sampled = self.should_log_start();
+        let log_table_enabled = self.log_table_enabled;
+
+        let t_country = Instant::now();
+        let country = resolve_country(
+            explicit_country_code,
+            headers,
+            remote_ip,
+            &self.fallback_country_code,
+            self.geoip.as_ref(),
+        )
+        .await;
+        let country_dur = t_country.elapsed();
+
+        if sampled {
+            info!(
+                "appsettings.step=country_resolve op=get duration_ms={} country={}",
+                dur_ms(country_dur),
+                country.as_deref().unwrap_or("")
+            );
+        }
+
+        let key = TwoLevelCache::key(app_device_id, version_number, country.as_deref());
+
+        loop {
+            let t_cache = Instant::now();
+            let cached = self.cache.get(&key).await.map_err(|_| ServiceError::Internal)?;
+            let cache_dur = t_cache.elapsed();
+
+            if sampled {
+                info!(
+                    "appsettings.step=cache_get op=get duration_ms={} state={:?} not_found={}",
+                    dur_ms(cache_dur),
+                    cached.state,
+                    cached.not_found
+                );
+            }
+
+            let total_ms = dur_ms(t0.elapsed());
+            let log_end = self.should_log_end(sampled, total_ms);
+
+            if cached.not_found && cached.state != CacheState::Miss {
+                self.metrics.observe(
+                    metric_bucket(version_number, cached.state),
+                    t0.elapsed(),
+                    cache_dur,
+                    std::time::Duration::ZERO,
+                );
+                if log_table_enabled && log_end {
+                    info!(
+                        "\n+----------------------+--------------------------------------+\n\
+| FIELD                | VALUE                                |\n\
++----------------------+--------------------------------------+\n\
+| country              | {:<36} |\n\
+| cache_state          | {:<36} |\n\
+| cache_ms             | {:<36} |\n\
+| backend_ms           | {:<36} |\n\
+| total_ms             | {:<36} |\n\
+| outcome              | {:<36} |\n\
++----------------------+--------------------------------------+",
+                        country.as_deref().unwrap_or(""),
+                        format!("{:?}", cached.state),
+                        format!("{} ms", dur_ms(cache_dur)),
+                        "0 ms".to_string(),
+                        format!("{} ms", total_ms),
+                        "not_found"
+                    );
+                }
+                if log_end {
+                    info!("appsettings.step=end op=get outcome=not_found total_ms={}", total_ms);
+                }
+                return match version_number {
+                    Some(v) => Err(ServiceError::VersionNotFound(v.to_string())),
+                    None => Err(ServiceError::NotFound),
+                };
+            }
+
+            if let Some(v) = cached.value {
+                if matches!(cached.state, CacheState::Fresh | CacheState::Stale) {
+                    self.metrics.observe(
+                        metric_bucket(version_number, cached.state),
+                        t0.elapsed(),
+                        cache_dur,
+                        std::time::Duration::ZERO,
+                    );
+                    if log_table_enabled && log_end {
+                        info!(
+                            "\n+----------------------+--------------------------------------+\n\
+| FIELD                | VALUE                                |\n\
++----------------------+--------------------------------------+\n\
+| country              | {:<36} |\n\
+| cache_state          | {:<36} |\n\
+| cache_ms             | {:<36} |\n\
+| backend_ms           | {:<36} |\n\
+| total_ms             | {:<36} |\n\
+| outcome              | {:<36} |\n\
++----------------------+--------------------------------------+",
+                            country.as_deref().unwrap_or(""),
+                            format!("{:?}", cached.state),
+                            format!("{} ms", dur_ms(cache_dur)),
+                            "0 ms".to_string(),
+                            format!("{} ms", total_ms),
+                            "cache_hit"
+                        );
+                    }
+                    if log_end {
+                        info!(
+                            "appsettings.step=end op=get outcome=cache_hit state={:?} total_ms={}",
+                            cached.state, total_ms
+                        );
+                    }
+
+                    // True SWR: if stale, serve immediately and refresh in background.
+                    if cached.state == CacheState::Stale {
+                        // Only one in-flight refresh per key.
+                        use dashmap::mapref::entry::Entry;
+                        let refresh_key = key.clone();
+                        match self.in_flight.entry(refresh_key.clone()) {
+                            Entry::Vacant(e) => {
+                                let notify = Arc::new(Notify::new());
+                                e.insert(notify.clone());
+
+                                let svc = self.clone();
+                                let app_device_id_owned = app_device_id.to_string();
+                                let version_owned = version_number.map(|s| s.to_string());
+                                let country_owned = country.clone();
+                                let headers_owned = headers.clone();
+                                let secret_key_owned = secret_key.to_string();
+
+                                tokio::spawn(async move {
+                                    let res = svc
+                                        .fetch_backend_and_update_cache(
+                                            Instant::now(),
+                                            &refresh_key,
+                                            &app_device_id_owned,
+                                            version_owned.as_deref(),
+                                            country_owned.as_deref(),
+                                            &headers_owned,
+                                            &secret_key_owned,
+                                            std::time::Duration::ZERO,
+                                            false,
+                                        )
+                                        .await;
+
+                                    svc.in_flight.remove(&refresh_key);
+                                    notify.notify_waiters();
+                                    let _ = res;
+                                });
+                            }
+                            Entry::Occupied(_) => {}
+                        }
+                    }
+
+                    return Ok(v);
+                }
+            }
+
+            // Cache miss: single-flight backend fetch (avoid stampede).
+            use dashmap::mapref::entry::Entry;
+            match self.in_flight.entry(key.clone()) {
+                Entry::Occupied(o) => {
+                    let notify = o.get().clone();
+                    notify.notified().await;
+                    continue; // Re-check cache after the fetcher updates it.
+                }
+                Entry::Vacant(vacant) => {
+                    let notify = Arc::new(Notify::new());
+                    vacant.insert(notify.clone());
+
+                    let res = self
+                        .fetch_backend_and_update_cache(
+                            t0,
+                            &key,
+                            app_device_id,
+                            version_number,
+                            country.as_deref(),
+                            headers,
+                            secret_key,
+                            cache_dur,
+                            sampled,
+                        )
+                        .await;
+
+                    self.in_flight.remove(&key);
+                    notify.notify_waiters();
+                    return res;
+                }
+            }
+        }
+    }
+
+    async fn fetch_backend_and_update_cache(
+        &self,
+        t0: Instant,
+        key: &str,
+        app_device_id: &str,
+        version_number: Option<&str>,
+        country: Option<&str>,
+        headers: &HeaderMap,
+        secret_key: &str,
+        cache_dur: Duration,
+        sampled: bool,
+    ) -> Result<AppSettingsResponse, ServiceError> {
+        let log_slow_ms = self.log_slow_ms;
+        let log_table_enabled = self.log_table_enabled;
+
+        let emit_table = |outcome: &str, cache_state: CacheState, cache_ms: u128, backend_ms: u128, total_ms: u128, country: Option<&str>| {
+            if !log_table_enabled {
+                return;
+            }
+            if !sampled && total_ms < log_slow_ms {
+                return;
+            }
             info!(
                 "\n+----------------------+--------------------------------------+\n\
 | FIELD                | VALUE                                |\n\
@@ -76,7 +322,7 @@ impl AppSettingsService {
 | total_ms             | {:<36} |\n\
 | outcome              | {:<36} |\n\
 +----------------------+--------------------------------------+",
-                country.as_deref().unwrap_or(""),
+                country.unwrap_or(""),
                 format!("{:?}", cache_state),
                 format!("{} ms", cache_ms),
                 format!("{} ms", backend_ms),
@@ -84,139 +330,71 @@ impl AppSettingsService {
                 outcome
             );
         };
-        info!(
-            "appsettings.step=start op=get app_device_id={} version={}",
-            app_device_id,
-            version_number.unwrap_or("")
-        );
-
-        let t_country = Instant::now();
-        let country = resolve_country(
-            explicit_country_code,
-            headers,
-            remote_ip,
-            &self.fallback_country_code,
-            self.geoip.as_ref(),
-        );
-        let country_dur = t_country.elapsed();
-        info!(
-            "appsettings.step=country_resolve op=get duration_ms={} country={}",
-            dur_ms(country_dur),
-            country.as_deref().unwrap_or("")
-        );
-
-        let key = TwoLevelCache::key(app_device_id, version_number, country.as_deref());
-        let t_cache = Instant::now();
-        let cached = self.cache.get(&key).await.map_err(|_| ServiceError::Internal)?;
-        let cache_dur = t_cache.elapsed();
-        info!(
-            "appsettings.step=cache_get op=get duration_ms={} state={:?} not_found={}",
-            dur_ms(cache_dur),
-            cached.state,
-            cached.not_found
-        );
-
-        if cached.not_found && cached.state != CacheState::Miss {
-            self.metrics.observe(metric_bucket(version_number, cached.state), t0.elapsed(), cache_dur, std::time::Duration::ZERO);
-            emit_table(
-                "not_found",
-                &country,
-                cached.state,
-                dur_ms(cache_dur),
-                0,
-                dur_ms(t0.elapsed()),
-            );
-            info!(
-                "appsettings.step=end op=get outcome=not_found total_ms={}",
-                dur_ms(t0.elapsed())
-            );
-            return match version_number {
-                Some(v) => Err(ServiceError::VersionNotFound(v.to_string())),
-                None => Err(ServiceError::NotFound),
-            };
-        }
-        if let Some(v) = cached.value {
-            if matches!(cached.state, CacheState::Fresh | CacheState::Stale) {
-                self.metrics.observe(metric_bucket(version_number, cached.state), t0.elapsed(), cache_dur, std::time::Duration::ZERO);
-                emit_table(
-                    "cache_hit",
-                    &country,
-                    cached.state,
-                    dur_ms(cache_dur),
-                    0,
-                    dur_ms(t0.elapsed()),
-                );
-                info!(
-                    "appsettings.step=end op=get outcome=cache_hit state={:?} total_ms={}",
-                    cached.state,
-                    dur_ms(t0.elapsed())
-                );
-                return Ok(v);
-            }
-        }
 
         let t_backend = Instant::now();
-        let _permit = self.backend_sem.acquire().await.map_err(|_| ServiceError::Internal)?;
+        if sampled {
+            info!("appsettings.step=backend_call op=get duration_ms=..");
+        }
+        let _permit = self
+            .backend_sem
+            .acquire()
+            .await
+            .map_err(|_| ServiceError::Internal)?;
+
         let fetched = self
             .backend
             .get_app_settings::<AppSettingsResponse>(
                 app_device_id,
                 version_number,
-                country.as_deref(),
+                country,
                 secret_key,
                 headers,
             )
             .await;
+
         let backend_dur = t_backend.elapsed();
-        info!(
-            "appsettings.step=backend_call op=get duration_ms={}",
-            dur_ms(backend_dur)
-        );
+        let total_ms = dur_ms(t0.elapsed());
+        if sampled {
+            info!(
+                "appsettings.step=backend_call op=get duration_ms={}",
+                dur_ms(backend_dur)
+            );
+        }
 
         match fetched {
             Ok(v) => {
-                let t_set = Instant::now();
-                let _ = self.cache.set_value(&key, v.clone()).await;
-                let set_dur = t_set.elapsed();
-                self.metrics.observe(metric_bucket(version_number, CacheState::Miss), t0.elapsed(), cache_dur, backend_dur);
+                let _ = self.cache.set_value(key, v.clone()).await;
+                self.metrics.observe(
+                    metric_bucket(version_number, CacheState::Miss),
+                    t0.elapsed(),
+                    cache_dur,
+                    backend_dur,
+                );
                 emit_table(
                     "backend_success",
-                    &country,
                     CacheState::Miss,
                     dur_ms(cache_dur),
                     dur_ms(backend_dur),
-                    dur_ms(t0.elapsed()),
-                );
-                info!(
-                    "appsettings.step=cache_set op=get duration_ms={} kind=value",
-                    dur_ms(set_dur)
-                );
-                info!(
-                    "appsettings.step=end op=get outcome=backend_success total_ms={}",
-                    dur_ms(t0.elapsed())
+                    total_ms,
+                    country,
                 );
                 Ok(v)
             }
             Err(BackendError::NotFound) => {
-                let t_set = Instant::now();
-                let _ = self.cache.set_not_found(&key).await;
-                let set_dur = t_set.elapsed();
-                self.metrics.observe(metric_bucket(version_number, CacheState::Miss), t0.elapsed(), cache_dur, backend_dur);
+                let _ = self.cache.set_not_found(key).await;
+                self.metrics.observe(
+                    metric_bucket(version_number, CacheState::Miss),
+                    t0.elapsed(),
+                    cache_dur,
+                    backend_dur,
+                );
                 emit_table(
                     "backend_not_found",
-                    &country,
                     CacheState::Miss,
                     dur_ms(cache_dur),
                     dur_ms(backend_dur),
-                    dur_ms(t0.elapsed()),
-                );
-                info!(
-                    "appsettings.step=cache_set op=get duration_ms={} kind=not_found",
-                    dur_ms(set_dur)
-                );
-                info!(
-                    "appsettings.step=end op=get outcome=backend_not_found total_ms={}",
-                    dur_ms(t0.elapsed())
+                    total_ms,
+                    country,
                 );
                 match version_number {
                     Some(v) => Err(ServiceError::VersionNotFound(v.to_string())),
@@ -224,8 +402,10 @@ impl AppSettingsService {
                 }
             }
             Err(BackendError::Http { status: 400, .. }) => {
-                if let Some(fallback) = fallback_for_invalid_country(&country, &self.fallback_country_code) {
-                    let fallback_key = TwoLevelCache::key(app_device_id, version_number, Some(&fallback));
+                if let Some(fallback) = fallback_for_invalid_country(country, &self.fallback_country_code)
+                {
+                    let fallback_key =
+                        TwoLevelCache::key(app_device_id, version_number, Some(&fallback));
                     let t_retry = Instant::now();
                     let retry = self
                         .backend
@@ -239,62 +419,58 @@ impl AppSettingsService {
                         .await
                         .map_err(|_| ServiceError::Upstream)?;
                     let retry_dur = t_retry.elapsed();
-                    info!(
-                        "appsettings.step=backend_retry_fallback op=get duration_ms={} fallback_country={}",
-                        dur_ms(retry_dur),
-                        fallback
-                    );
-                    let t_set = Instant::now();
+
+                    // Cache aliasing: set both original (invalid) key and fallback key.
                     let _ = self.cache.set_value(&fallback_key, retry.clone()).await;
-                    let set_dur = t_set.elapsed();
-                    self.metrics.observe(metric_bucket(version_number, CacheState::Miss), t0.elapsed(), cache_dur, backend_dur + retry_dur);
+                    let _ = self.cache.set_value(key, retry.clone()).await;
+
+                    self.metrics.observe(
+                        metric_bucket(version_number, CacheState::Miss),
+                        t0.elapsed(),
+                        cache_dur,
+                        backend_dur + retry_dur,
+                    );
                     emit_table(
                         "fallback_success",
-                        &country,
                         CacheState::Miss,
                         dur_ms(cache_dur),
                         dur_ms(backend_dur + retry_dur),
-                        dur_ms(t0.elapsed()),
-                    );
-                    info!(
-                        "appsettings.step=cache_set op=get duration_ms={} kind=value_fallback",
-                        dur_ms(set_dur)
-                    );
-                    info!(
-                        "appsettings.step=end op=get outcome=fallback_success total_ms={}",
-                        dur_ms(t0.elapsed())
+                        total_ms,
+                        country,
                     );
                     Ok(retry)
                 } else {
-                    self.metrics.observe(metric_bucket(version_number, CacheState::Miss), t0.elapsed(), cache_dur, backend_dur);
+                    self.metrics.observe(
+                        metric_bucket(version_number, CacheState::Miss),
+                        t0.elapsed(),
+                        cache_dur,
+                        backend_dur,
+                    );
                     emit_table(
                         "backend_400_no_fallback",
-                        &country,
                         CacheState::Miss,
                         dur_ms(cache_dur),
                         dur_ms(backend_dur),
-                        dur_ms(t0.elapsed()),
-                    );
-                    info!(
-                        "appsettings.step=end op=get outcome=backend_400_no_fallback total_ms={}",
-                        dur_ms(t0.elapsed())
+                        total_ms,
+                        country,
                     );
                     Err(ServiceError::Upstream)
                 }
             }
             Err(_) => {
-                self.metrics.observe(metric_bucket(version_number, CacheState::Miss), t0.elapsed(), cache_dur, backend_dur);
+                self.metrics.observe(
+                    metric_bucket(version_number, CacheState::Miss),
+                    t0.elapsed(),
+                    cache_dur,
+                    backend_dur,
+                );
                 emit_table(
                     "backend_error",
-                    &country,
                     CacheState::Miss,
                     dur_ms(cache_dur),
                     dur_ms(backend_dur),
-                    dur_ms(t0.elapsed()),
-                );
-                info!(
-                    "appsettings.step=end op=get outcome=backend_error total_ms={}",
-                    dur_ms(t0.elapsed())
+                    total_ms,
+                    country,
                 );
                 Err(ServiceError::Upstream)
             }
@@ -316,7 +492,8 @@ impl AppSettingsService {
             remote_ip,
             &self.fallback_country_code,
             self.geoip.as_ref(),
-        );
+        )
+        .await;
         let key = TwoLevelCache::key(app_device_id, version_number, country.as_deref());
         let cached = self.cache.get(&key).await.map_err(|_| ServiceError::Internal)?;
         if cached.not_found && cached.state != CacheState::Miss {
@@ -342,7 +519,7 @@ fn dur_ms(d: Duration) -> u128 {
     d.as_millis()
 }
 
-fn resolve_country(
+async fn resolve_country(
     explicit_country_code: Option<&str>,
     headers: &HeaderMap,
     remote_ip: Option<String>,
@@ -358,9 +535,15 @@ fn resolve_country(
     if let Some(ip_str) = ip {
         if !is_private_or_loopback(&ip_str) {
             if let Some(g) = geoip {
-                if let Ok(cc) = g.lookup_country_code(&ip_str) {
-                    if !cc.trim().is_empty() {
-                        return Some(cc.trim().to_uppercase());
+                // GeoIP lookup can be CPU-heavy; offload so we don't block Tokio worker threads.
+                let g = Arc::clone(g);
+                let ip_for_lookup = ip_str.clone();
+                if let Ok(res) = tokio::task::spawn_blocking(move || g.lookup_country_code(&ip_for_lookup)).await
+                {
+                    if let Ok(cc) = res {
+                        if !cc.trim().is_empty() {
+                            return Some(cc.trim().to_uppercase());
+                        }
                     }
                 }
             }
@@ -425,11 +608,11 @@ fn is_private_or_loopback(ip_str: &str) -> bool {
     }
 }
 
-fn fallback_for_invalid_country(country: &Option<String>, fallback: &str) -> Option<String> {
+fn fallback_for_invalid_country(country: Option<&str>, fallback: &str) -> Option<String> {
     if fallback.trim().is_empty() {
         return None;
     }
-    if country.as_deref().unwrap_or_default().eq_ignore_ascii_case(fallback) {
+    if country.unwrap_or_default().eq_ignore_ascii_case(fallback) {
         return None;
     }
     Some(fallback.to_string())

@@ -21,6 +21,10 @@ pub struct AppConfig {
     pub mem_cache_negative_ttl: Duration,
     pub mem_cache_max_keys: usize,
     pub backend_max_inflight: usize,
+    pub log_slow_ms: u128,
+    pub log_sample_rate: u64,
+    pub log_table_enabled: bool,
+    pub metrics_sample_rate: u64,
 }
 
 impl AppConfig {
@@ -55,6 +59,10 @@ impl AppConfig {
             mem_cache_negative_ttl: get_duration("MEM_CACHE_NEGATIVE_TTL", Duration::from_secs(5)),
             mem_cache_max_keys: get_usize("MEM_CACHE_MAX_KEYS", 200_000),
             backend_max_inflight: get_usize("BACKEND_MAX_INFLIGHT", 200),
+            log_slow_ms: get_usize("LOG_SLOW_MS", 50) as u128,
+            log_sample_rate: get_usize("LOG_SAMPLE_RATE", 1000) as u64,
+            log_table_enabled: get_bool("LOG_TABLE_ENABLED", false),
+            metrics_sample_rate: get_usize("METRICS_SAMPLE_RATE", 1000) as u64,
         })
     }
 }

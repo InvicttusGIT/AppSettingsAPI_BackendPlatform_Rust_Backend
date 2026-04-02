@@ -56,26 +56,32 @@ pub async fn get_app_settings(
     Query(q): Query<AppSettingsQuery>,
 ) -> Response {
     let t0 = Instant::now();
-    info!(
-        "appsettings.request.start method=GET path=/api/v1/appsetting-api/app-settings app_device_id={} version={} country_code={} async={}",
-        q.app_device_id,
-        q.version_number.as_deref().unwrap_or(""),
-        q.country_code
-            .as_deref()
-            .or(q.country.as_deref())
-            .unwrap_or(""),
-        q.r#async.as_deref().unwrap_or("")
-    );
+    let sampled = state.service.should_log_start();
+    if sampled {
+        info!(
+            "appsettings.request.start method=GET path=/api/v1/appsetting-api/app-settings app_device_id={} version={} country_code={} async={}",
+            q.app_device_id,
+            q.version_number.as_deref().unwrap_or(""),
+            q.country_code
+                .as_deref()
+                .or(q.country.as_deref())
+                .unwrap_or(""),
+            q.r#async.as_deref().unwrap_or("")
+        );
+    }
 
     if q.app_device_id.trim().is_empty() {
         let resp = (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "app_device_id is required (UUID format from apprepository_app_devices table)" })),
         ).into_response();
-        info!(
-            "appsettings.request.end status=400 total_ms={} reason=missing_app_device_id",
-            t0.elapsed().as_millis()
-        );
+        let total_ms = t0.elapsed().as_millis();
+        if state.service.should_log_end(sampled, total_ms) {
+            info!(
+                "appsettings.request.end status=400 total_ms={} reason=missing_app_device_id",
+                total_ms
+            );
+        }
         return resp;
     }
     if Uuid::parse_str(&q.app_device_id).is_err() {
@@ -83,10 +89,13 @@ pub async fn get_app_settings(
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "app_device_id must be a valid UUID format" })),
         ).into_response();
-        info!(
-            "appsettings.request.end status=400 total_ms={} reason=invalid_uuid",
-            t0.elapsed().as_millis()
-        );
+        let total_ms = t0.elapsed().as_millis();
+        if state.service.should_log_end(sampled, total_ms) {
+            info!(
+                "appsettings.request.end status=400 total_ms={} reason=invalid_uuid",
+                total_ms
+            );
+        }
         return resp;
     }
 
@@ -95,10 +104,13 @@ pub async fn get_app_settings(
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "X-Secret-Key header is required" })),
         ).into_response();
-        info!(
-            "appsettings.request.end status=401 total_ms={} reason=missing_secret_key",
-            t0.elapsed().as_millis()
-        );
+        let total_ms = t0.elapsed().as_millis();
+        if state.service.should_log_end(sampled, total_ms) {
+            info!(
+                "appsettings.request.end status=401 total_ms={} reason=missing_secret_key",
+                total_ms
+            );
+        }
         return resp;
     };
 
@@ -133,10 +145,13 @@ pub async fn get_app_settings(
                     Json(json!(resp)),
                 )
                     .into_response();
-                info!(
-                    "appsettings.request.end status=200 total_ms={} mode=async-cache",
-                    t0.elapsed().as_millis()
-                );
+                let total_ms = t0.elapsed().as_millis();
+                if state.service.should_log_end(sampled, total_ms) {
+                    info!(
+                        "appsettings.request.end status=200 total_ms={} mode=async-cache",
+                        total_ms
+                    );
+                }
                 return out;
             }
             Ok((None, false)) => {
@@ -171,11 +186,14 @@ pub async fn get_app_settings(
         ),
     }.into_response();
 
-    info!(
-        "appsettings.request.end status={} total_ms={} mode=sync",
-        response.status().as_u16(),
-        t0.elapsed().as_millis()
-    );
+    let total_ms = t0.elapsed().as_millis();
+    if state.service.should_log_end(sampled, total_ms) {
+        info!(
+            "appsettings.request.end status={} total_ms={} mode=sync",
+            response.status().as_u16(),
+            total_ms
+        );
+    }
     response
 }
 

@@ -1,4 +1,11 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}, time::{Duration, SystemTime}};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, SystemTime},
+};
 
 use hdrhistogram::Histogram;
 use serde::Serialize;
@@ -6,6 +13,8 @@ use serde::Serialize;
 #[derive(Clone)]
 pub struct AppSettingsMetrics {
     inner: Arc<Mutex<HashMap<String, Bucket>>>,
+    sample_rate: u64,
+    sample_counter: Arc<AtomicU64>,
 }
 
 struct Bucket {
@@ -40,15 +49,23 @@ pub struct Snapshot {
 }
 
 impl AppSettingsMetrics {
-    pub fn new() -> Self {
+    pub fn new(sample_rate: u64) -> Self {
         Self {
             inner: Arc::new(Mutex::new(HashMap::new())),
+            sample_rate: sample_rate.max(1),
+            sample_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub fn observe(&self, name: &str, total: Duration, cache: Duration, backend: Duration) {
         if name.is_empty() {
             return;
+        }
+        if self.sample_rate > 1 {
+            let n = self.sample_counter.fetch_add(1, Ordering::Relaxed);
+            if n % self.sample_rate != 0 {
+                return;
+            }
         }
         let mut m = match self.inner.lock() {
             Ok(v) => v,

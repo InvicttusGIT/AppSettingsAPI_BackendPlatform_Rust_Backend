@@ -38,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
 
     let redis_client = redis::Client::open(cfg.redis_url.clone())?;
     let backend_client = BackendClient::new(cfg.backend_base_url.clone(), cfg.request_timeout)?;
-    let metrics = AppSettingsMetrics::new();
+    let metrics = AppSettingsMetrics::new(cfg.metrics_sample_rate);
 
     let geoip: Option<Arc<dyn GeoIpService>> = if cfg.geoip_db_path.trim().is_empty() {
         None
@@ -88,6 +88,9 @@ async fn main() -> anyhow::Result<()> {
         cfg.fallback_country_code,
         geoip,
         metrics,
+        cfg.log_slow_ms,
+        cfg.log_sample_rate,
+        cfg.log_table_enabled,
     ));
 
     let app_state = AppState { service };
