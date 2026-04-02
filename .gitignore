@@ -2,7 +2,7 @@
 target/
 
 # Secrets
-.env
+
 
 # GeoIP database (large binary; download/manage outside git)
 
