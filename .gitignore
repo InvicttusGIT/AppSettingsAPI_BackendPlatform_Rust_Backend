@@ -5,7 +5,6 @@ target/
 .env
 
 # GeoIP database (large binary; download/manage outside git)
-geoip/*.mmdb
 
 # OS/editor junk (optional)
 *.swp
