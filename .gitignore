@@ -1,0 +1,16 @@
+# Build artifacts
+target/
+
+# Secrets
+.env
+
+# GeoIP database (large binary; download/manage outside git)
+geoip/*.mmdb
+
+# OS/editor junk (optional)
+*.swp
+*.swo
+*.DS_Store
+
+# Accidental local file
+NUL
