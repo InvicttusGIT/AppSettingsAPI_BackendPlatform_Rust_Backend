@@ -43,7 +43,13 @@ async fn main() -> anyhow::Result<()> {
     });
     let redis_pool = redis_cfg
         .create_pool(Some(deadpool_redis::Runtime::Tokio1))?;
-    let backend_client = BackendClient::new(cfg.backend_base_url.clone(), cfg.request_timeout)?;
+    let backend_client = BackendClient::new(
+        cfg.backend_base_url.clone(),
+        cfg.request_timeout,
+        cfg.backend_connect_timeout,
+        cfg.backend_http_pool_max_idle_per_host,
+        cfg.backend_http_pool_idle_timeout,
+    )?;
     let metrics = AppSettingsMetrics::new(cfg.metrics_sample_rate);
 
     let geoip: Option<Arc<dyn GeoIpService>> = if cfg.geoip_db_path.trim().is_empty() {

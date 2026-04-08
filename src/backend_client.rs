@@ -21,12 +21,18 @@ pub struct BackendClient {
 }
 
 impl BackendClient {
-    pub fn new(base_url: String, timeout: Duration) -> anyhow::Result<Self> {
+    pub fn new(
+        base_url: String,
+        timeout: Duration,
+        connect_timeout: Duration,
+        pool_max_idle_per_host: usize,
+        pool_idle_timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(2000)
-            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(pool_max_idle_per_host.max(8))
+            .pool_idle_timeout(pool_idle_timeout)
             .tcp_keepalive(Some(Duration::from_secs(30)))
-            .connect_timeout(Duration::from_secs(3))
+            .connect_timeout(connect_timeout)
             .timeout(timeout)
             .build()?;
         Ok(Self { base_url, client })
