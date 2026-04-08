@@ -7,12 +7,18 @@ mod metrics;
 mod models;
 mod service;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 use std::sync::Arc;
 
-use axum::{routing::get, Router};
+use axum::{
+    error_handling::HandleErrorLayer,
+    http::StatusCode,
+    routing::get,
+    BoxError, Router,
+};
 use dotenvy::dotenv;
 use handlers::{appsettings_metrics, get_app_settings, health, AppState};
+use tower::{limit::ConcurrencyLimitLayer, load_shed::LoadShedLayer, timeout::TimeoutLayer, ServiceBuilder};
 use tracing::info;
 
 use crate::{
@@ -35,6 +41,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cfg = AppConfig::from_env()?;
     info!("Starting BackendPlatform_Rust_API env={} addr={}", cfg.env, cfg.listen_addr);
+    info!(
+        "Overload controls inbound_max_inflight={} inbound_timeout_ms={} backend_max_inflight={} cache_pool_size={}",
+        cfg.inbound_max_inflight,
+        cfg.inbound_request_timeout.as_millis(),
+        cfg.backend_max_inflight,
+        cfg.cache_pool_size
+    );
 
     let mut redis_cfg = deadpool_redis::Config::from_url(cfg.cache_url.clone());
     redis_cfg.pool = Some(deadpool::managed::PoolConfig {
@@ -112,10 +125,30 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let app_state = AppState { service };
+    let overload_layer = ServiceBuilder::new()
+        .layer(HandleErrorLayer::new(|err: BoxError| async move {
+            if err.is::<tower::timeout::error::Elapsed>() {
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request timed out under load",
+                )
+            } else {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "server overloaded, please retry",
+                )
+            }
+        }))
+        .layer(LoadShedLayer::new())
+        .layer(ConcurrencyLimitLayer::new(cfg.inbound_max_inflight))
+        .layer(TimeoutLayer::new(cfg.inbound_request_timeout))
+        .into_inner();
+
     let app = Router::new()
         .route("/health", get(health))
         .route("/internal/metrics/appsettings", get(appsettings_metrics))
         .route("/api/v1/appsetting-api/app-settings", get(get_app_settings))
+        .layer(overload_layer)
         .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind(cfg.listen_addr).await?;

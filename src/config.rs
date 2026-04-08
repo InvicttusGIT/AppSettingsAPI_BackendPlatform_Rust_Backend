@@ -35,6 +35,8 @@ pub struct AppConfig {
     pub load_debug_enabled: bool,
     pub wait_warn_ms: u64,
     pub cache_wait_warn_ms: u64,
+    pub inbound_max_inflight: usize,
+    pub inbound_request_timeout: Duration,
 }
 
 impl AppConfig {
@@ -81,6 +83,8 @@ impl AppConfig {
             load_debug_enabled: get_bool("LOAD_DEBUG_ENABLED", false),
             wait_warn_ms: get_usize("WAIT_WARN_MS", 2000) as u64,
             cache_wait_warn_ms: get_usize("CACHE_WAIT_WARN_MS", 1000) as u64,
+            inbound_max_inflight: get_usize("INBOUND_MAX_INFLIGHT", 2000).max(1),
+            inbound_request_timeout: get_duration("INBOUND_REQUEST_TIMEOUT", Duration::from_secs(8)),
         })
     }
 }
