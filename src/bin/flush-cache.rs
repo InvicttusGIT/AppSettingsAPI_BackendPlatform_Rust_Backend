@@ -1,17 +1,50 @@
 use dotenvy::dotenv;
 use redis::AsyncCommands;
 
+fn get(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
-    let redis_addr = std::env::var("REDIS_ADDR").unwrap_or_else(|_| "localhost:6379".to_string());
-    let redis_password = std::env::var("REDIS_PASSWORD").unwrap_or_default();
-    let redis_db: u8 = std::env::var("REDIS_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-
-    let redis_url = if redis_password.is_empty() {
-        format!("redis://{redis_addr}/{redis_db}")
+    let cache_provider = get("CACHE_PROVIDER", "redis").trim().to_lowercase();
+    let cache_url = if let Ok(url) = std::env::var("CACHE_URL") {
+        if !url.trim().is_empty() {
+            url
+        } else {
+            String::new()
+        }
     } else {
-        format!("redis://:{}@{redis_addr}/{redis_db}", redis_password)
+        String::new()
+    };
+    let redis_url = if !cache_url.is_empty() {
+        cache_url
+    } else if cache_provider == "keydb" {
+        let addr = get("KEYDB_ADDR", std::env::var("REDIS_ADDR").ok().as_deref().unwrap_or("localhost:6379"));
+        let password = std::env::var("KEYDB_PASSWORD")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var("REDIS_PASSWORD").ok().filter(|v| !v.trim().is_empty()))
+            .unwrap_or_default();
+        let db: u8 = std::env::var("KEYDB_DB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| std::env::var("REDIS_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        if password.is_empty() {
+            format!("redis://{addr}/{db}")
+        } else {
+            format!("redis://:{}@{addr}/{db}", password)
+        }
+    } else {
+        let addr = get("REDIS_ADDR", "localhost:6379");
+        let password = std::env::var("REDIS_PASSWORD").unwrap_or_default();
+        let db: u8 = std::env::var("REDIS_DB").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if password.is_empty() {
+            format!("redis://{addr}/{db}")
+        } else {
+            format!("redis://:{}@{addr}/{db}", password)
+        }
     };
 
     let client = redis::Client::open(redis_url)?;
@@ -36,7 +69,7 @@ async fn main() -> anyhow::Result<()> {
             break;
         }
     }
-    println!("Flushed {} app_settings key(s) from Redis (db={})", deleted, redis_db);
+    println!("Flushed {} app_settings key(s) from cache backend ({})", deleted, cache_provider);
     Ok(())
 }
 

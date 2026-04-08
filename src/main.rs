@@ -36,9 +36,9 @@ async fn main() -> anyhow::Result<()> {
     let cfg = AppConfig::from_env()?;
     info!("Starting BackendPlatform_Rust_API env={} addr={}", cfg.env, cfg.listen_addr);
 
-    let mut redis_cfg = deadpool_redis::Config::from_url(cfg.redis_url.clone());
+    let mut redis_cfg = deadpool_redis::Config::from_url(cfg.cache_url.clone());
     redis_cfg.pool = Some(deadpool::managed::PoolConfig {
-        max_size: cfg.redis_pool_size,
+        max_size: cfg.cache_pool_size,
         ..Default::default()
     });
     let redis_pool = redis_cfg
@@ -83,6 +83,8 @@ async fn main() -> anyhow::Result<()> {
         redis_pool,
         cfg.mem_cache_enabled,
         cfg.mem_cache_max_keys,
+        cfg.mem_cache_evict_scan,
+        cfg.mem_cache_hard_max_multiplier,
         effective_ttl,
         effective_stale_window,
         cfg.negative_cache_ttl.max(cfg.mem_cache_negative_ttl),

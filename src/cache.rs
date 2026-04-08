@@ -36,6 +36,8 @@ pub struct TwoLevelCache {
     l1: DashMap<String, CacheEnvelope>,
     l1_enabled: bool,
     l1_max_keys: usize,
+    l1_evict_scan: usize,
+    l1_hard_max_multiplier: usize,
     ttl: Duration,
     stale_window: Duration,
     negative_ttl: Duration,
@@ -46,6 +48,8 @@ impl TwoLevelCache {
         redis_pool: deadpool_redis::Pool,
         l1_enabled: bool,
         l1_max_keys: usize,
+        l1_evict_scan: usize,
+        l1_hard_max_multiplier: usize,
         ttl: Duration,
         stale_window: Duration,
         negative_ttl: Duration,
@@ -55,6 +59,8 @@ impl TwoLevelCache {
             l1: DashMap::new(),
             l1_enabled,
             l1_max_keys,
+            l1_evict_scan: l1_evict_scan.max(64),
+            l1_hard_max_multiplier: l1_hard_max_multiplier.max(1),
             ttl,
             stale_window,
             negative_ttl,
@@ -84,7 +90,10 @@ impl TwoLevelCache {
                         not_found: env.not_found,
                     });
                 }
+                // Expired entry: eagerly drop it.
+                self.l1.remove(key);
             }
+            self.l1_prune_if_needed(now);
         }
 
         let mut conn = self.redis_pool.get().await?;
@@ -99,9 +108,7 @@ impl TwoLevelCache {
         }
 
         if self.l1_enabled {
-            if self.l1.len() > self.l1_max_keys {
-                self.l1.clear();
-            }
+            self.l1_prune_if_needed(now);
             self.l1.insert(key.to_string(), env.clone());
         }
 
@@ -128,12 +135,43 @@ impl TwoLevelCache {
         let mut conn = self.redis_pool.get().await?;
         let _: () = conn.set_ex(key, payload, ttl_secs).await?;
         if self.l1_enabled {
-            if self.l1.len() > self.l1_max_keys {
-                self.l1.clear();
-            }
+            self.l1_prune_if_needed(now_ms());
             self.l1.insert(key.to_string(), env);
         }
         Ok(())
+    }
+
+    fn l1_prune_if_needed(&self, now: i64) {
+        if !self.l1_enabled || self.l1_max_keys == 0 {
+            return;
+        }
+        let len = self.l1.len();
+        if len <= self.l1_max_keys {
+            return;
+        }
+
+        // Prefer removing expired entries first.
+        let mut removed = 0usize;
+        for r in self.l1.iter().take(self.l1_evict_scan) {
+            if r.value().stale_until_ms < now {
+                self.l1.remove(r.key());
+                removed += 1;
+            }
+        }
+
+        // Still too big: evict a small batch (best-effort) to get under max.
+        if removed == 0 && self.l1.len() > self.l1_max_keys {
+            let target = (self.l1.len() - self.l1_max_keys).min(self.l1_evict_scan);
+            for r in self.l1.iter().take(target) {
+                self.l1.remove(r.key());
+            }
+        }
+
+        // Hard cap safety: avoid unbounded growth if eviction can't keep up.
+        let hard_max = self.l1_max_keys.saturating_mul(self.l1_hard_max_multiplier.max(1));
+        if hard_max > 0 && self.l1.len() > hard_max {
+            self.l1.clear();
+        }
     }
 }
 
