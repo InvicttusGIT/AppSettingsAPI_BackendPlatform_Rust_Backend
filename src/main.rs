@@ -7,7 +7,7 @@ mod metrics;
 mod models;
 mod service;
 
-use std::{net::SocketAddr, time::Duration};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
