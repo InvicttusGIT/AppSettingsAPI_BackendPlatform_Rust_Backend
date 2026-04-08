@@ -3,6 +3,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use deadpool_redis::redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
+use tracing::{info, warn};
 
 use crate::models::AppSettingsResponse;
 
@@ -41,6 +42,8 @@ pub struct TwoLevelCache {
     ttl: Duration,
     stale_window: Duration,
     negative_ttl: Duration,
+    debug_enabled: bool,
+    wait_warn_ms: u64,
 }
 
 impl TwoLevelCache {
@@ -53,6 +56,8 @@ impl TwoLevelCache {
         ttl: Duration,
         stale_window: Duration,
         negative_ttl: Duration,
+        debug_enabled: bool,
+        wait_warn_ms: u64,
     ) -> Self {
         Self {
             redis_pool,
@@ -64,6 +69,8 @@ impl TwoLevelCache {
             ttl,
             stale_window,
             negative_ttl,
+            debug_enabled,
+            wait_warn_ms: wait_warn_ms.max(1),
         }
     }
 
@@ -80,8 +87,7 @@ impl TwoLevelCache {
     pub async fn get(&self, key: &str) -> anyhow::Result<CacheResult> {
         let now = now_ms();
         if self.l1_enabled {
-            if let Some(v) = self.l1.get(key) {
-                let env = v.clone();
+            if let Some(env) = self.l1.get(key).map(|v| v.clone()) {
                 if now <= env.stale_until_ms {
                     let state = if now <= env.fresh_until_ms { CacheState::Fresh } else { CacheState::Stale };
                     return Ok(CacheResult {
@@ -96,8 +102,28 @@ impl TwoLevelCache {
             self.l1_prune_if_needed(now);
         }
 
+        let t_pool = std::time::Instant::now();
         let mut conn = self.redis_pool.get().await?;
+        let pool_wait_ms = t_pool.elapsed().as_millis() as u64;
+        if pool_wait_ms >= self.wait_warn_ms {
+            warn!(
+                "cache.step=pool_get wait_ms={} key={} l1_size={}",
+                pool_wait_ms,
+                key,
+                self.l1.len()
+            );
+        } else if self.debug_enabled {
+            info!("cache.step=pool_get wait_ms={} key={}", pool_wait_ms, key);
+        }
+
+        let t_get = std::time::Instant::now();
         let raw: Option<String> = conn.get(key).await?;
+        let redis_get_ms = t_get.elapsed().as_millis() as u64;
+        if redis_get_ms >= self.wait_warn_ms {
+            warn!("cache.step=redis_get wait_ms={} key={}", redis_get_ms, key);
+        } else if self.debug_enabled {
+            info!("cache.step=redis_get wait_ms={} key={}", redis_get_ms, key);
+        }
         let Some(raw) = raw else {
             return Ok(CacheResult { value: None, state: CacheState::Miss, not_found: false });
         };
@@ -132,8 +158,32 @@ impl TwoLevelCache {
     async fn set_envelope(&self, key: &str, env: CacheEnvelope) -> anyhow::Result<()> {
         let ttl_secs = ((env.stale_until_ms - now_ms()) / 1000).max(1) as u64;
         let payload = serde_json::to_string(&env)?;
+        let t_pool = std::time::Instant::now();
         let mut conn = self.redis_pool.get().await?;
+        let pool_wait_ms = t_pool.elapsed().as_millis() as u64;
+        if pool_wait_ms >= self.wait_warn_ms {
+            warn!(
+                "cache.step=pool_get_for_set wait_ms={} key={} ttl_secs={}",
+                pool_wait_ms,
+                key,
+                ttl_secs
+            );
+        } else if self.debug_enabled {
+            info!(
+                "cache.step=pool_get_for_set wait_ms={} key={} ttl_secs={}",
+                pool_wait_ms,
+                key,
+                ttl_secs
+            );
+        }
+        let t_set = std::time::Instant::now();
         let _: () = conn.set_ex(key, payload, ttl_secs).await?;
+        let redis_set_ms = t_set.elapsed().as_millis() as u64;
+        if redis_set_ms >= self.wait_warn_ms {
+            warn!("cache.step=redis_set wait_ms={} key={}", redis_set_ms, key);
+        } else if self.debug_enabled {
+            info!("cache.step=redis_set wait_ms={} key={}", redis_set_ms, key);
+        }
         if self.l1_enabled {
             self.l1_prune_if_needed(now_ms());
             self.l1.insert(key.to_string(), env);
@@ -151,10 +201,15 @@ impl TwoLevelCache {
         }
 
         // Prefer removing expired entries first.
-        let mut removed = 0usize;
+        let mut expired_keys = Vec::new();
         for r in self.l1.iter().take(self.l1_evict_scan) {
             if r.value().stale_until_ms < now {
-                self.l1.remove(r.key());
+                expired_keys.push(r.key().clone());
+            }
+        }
+        let mut removed = 0usize;
+        for key in expired_keys {
+            if self.l1.remove(&key).is_some() {
                 removed += 1;
             }
         }
@@ -162,8 +217,14 @@ impl TwoLevelCache {
         // Still too big: evict a small batch (best-effort) to get under max.
         if removed == 0 && self.l1.len() > self.l1_max_keys {
             let target = (self.l1.len() - self.l1_max_keys).min(self.l1_evict_scan);
-            for r in self.l1.iter().take(target) {
-                self.l1.remove(r.key());
+            let keys: Vec<String> = self
+                .l1
+                .iter()
+                .take(target)
+                .map(|r| r.key().clone())
+                .collect();
+            for key in keys {
+                let _ = self.l1.remove(&key);
             }
         }
 

@@ -29,6 +29,9 @@ pub struct AppConfig {
     pub log_sample_rate: u64,
     pub log_table_enabled: bool,
     pub metrics_sample_rate: u64,
+    pub load_debug_enabled: bool,
+    pub wait_warn_ms: u64,
+    pub cache_wait_warn_ms: u64,
 }
 
 impl AppConfig {
@@ -69,6 +72,9 @@ impl AppConfig {
             log_sample_rate: get_usize("LOG_SAMPLE_RATE", 1000) as u64,
             log_table_enabled: get_bool("LOG_TABLE_ENABLED", false),
             metrics_sample_rate: get_usize("METRICS_SAMPLE_RATE", 1000) as u64,
+            load_debug_enabled: get_bool("LOAD_DEBUG_ENABLED", false),
+            wait_warn_ms: get_usize("WAIT_WARN_MS", 2000) as u64,
+            cache_wait_warn_ms: get_usize("CACHE_WAIT_WARN_MS", 1000) as u64,
         })
     }
 }

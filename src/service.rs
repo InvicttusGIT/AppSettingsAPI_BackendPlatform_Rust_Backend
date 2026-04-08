@@ -10,7 +10,8 @@ use axum::http::HeaderMap;
 use dashmap::DashMap;
 use thiserror::Error;
 use tokio::sync::{Notify, Semaphore};
-use tracing::info;
+use tokio::time::{Duration as TokioDuration, timeout};
+use tracing::{info, warn};
 
 use crate::{
     backend_client::{BackendClient, BackendError},
@@ -45,6 +46,8 @@ pub struct AppSettingsService {
     log_sample_rate: u64,
     log_table_enabled: bool,
     log_counter: Arc<AtomicU64>,
+    debug_enabled: bool,
+    wait_warn_ms: u64,
 }
 
 impl AppSettingsService {
@@ -58,6 +61,8 @@ impl AppSettingsService {
         log_slow_ms: u128,
         log_sample_rate: u64,
         log_table_enabled: bool,
+        debug_enabled: bool,
+        wait_warn_ms: u64,
     ) -> Self {
         Self {
             cache,
@@ -71,6 +76,8 @@ impl AppSettingsService {
             log_sample_rate: log_sample_rate.max(1),
             log_table_enabled,
             log_counter: Arc::new(AtomicU64::new(0)),
+            debug_enabled,
+            wait_warn_ms: wait_warn_ms.max(1),
         }
     }
 
@@ -244,7 +251,17 @@ impl AppSettingsService {
 
                                     svc.in_flight.remove(&refresh_key);
                                     notify.notify_waiters();
-                                    let _ = res;
+                                    if let Err(e) = res {
+                                        warn!(
+                                            "appsettings.step=background_refresh_done key={} status=error err={}",
+                                            refresh_key, e
+                                        );
+                                    } else if svc.debug_enabled {
+                                        info!(
+                                            "appsettings.step=background_refresh_done key={} status=ok",
+                                            refresh_key
+                                        );
+                                    }
                                 });
                             }
                             Entry::Occupied(_) => {}
@@ -260,7 +277,23 @@ impl AppSettingsService {
             match self.in_flight.entry(key.clone()) {
                 Entry::Occupied(o) => {
                     let notify = o.get().clone();
-                    notify.notified().await;
+                    drop(o);
+                    let mut waited = 0u64;
+                    loop {
+                        let slice = TokioDuration::from_millis(self.wait_warn_ms);
+                        match timeout(slice, notify.notified()).await {
+                            Ok(_) => break,
+                            Err(_) => {
+                                waited = waited.saturating_add(self.wait_warn_ms);
+                                warn!(
+                                    "appsettings.step=singleflight_wait key={} waited_ms={} inflight_keys={}",
+                                    key,
+                                    waited,
+                                    self.in_flight.len()
+                                );
+                            }
+                        }
+                    }
                     continue; // Re-check cache after the fetcher updates it.
                 }
                 Entry::Vacant(vacant) => {
@@ -335,11 +368,28 @@ impl AppSettingsService {
         if sampled {
             info!("appsettings.step=backend_call op=get duration_ms=..");
         }
+        let t_sem = Instant::now();
         let _permit = self
             .backend_sem
             .acquire()
             .await
             .map_err(|_| ServiceError::Internal)?;
+        let sem_wait_ms = dur_ms(t_sem.elapsed()) as u64;
+        if sem_wait_ms >= self.wait_warn_ms {
+            warn!(
+                "appsettings.step=backend_semaphore_wait wait_ms={} available_permits={} key={}",
+                sem_wait_ms,
+                self.backend_sem.available_permits(),
+                key
+            );
+        } else if self.debug_enabled {
+            info!(
+                "appsettings.step=backend_semaphore_wait wait_ms={} available_permits={} key={}",
+                sem_wait_ms,
+                self.backend_sem.available_permits(),
+                key
+            );
+        }
 
         let fetched = self
             .backend
@@ -354,6 +404,15 @@ impl AppSettingsService {
 
         let backend_dur = t_backend.elapsed();
         let total_ms = dur_ms(t0.elapsed());
+        let backend_ms = dur_ms(backend_dur) as u64;
+        if backend_ms >= self.wait_warn_ms {
+            warn!(
+                "appsettings.step=backend_call wait_ms={} key={} country={}",
+                backend_ms,
+                key,
+                country.unwrap_or("")
+            );
+        }
         if sampled {
             info!(
                 "appsettings.step=backend_call op=get duration_ms={}",

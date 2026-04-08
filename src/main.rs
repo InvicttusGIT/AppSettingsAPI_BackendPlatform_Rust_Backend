@@ -88,6 +88,8 @@ async fn main() -> anyhow::Result<()> {
         effective_ttl,
         effective_stale_window,
         cfg.negative_cache_ttl.max(cfg.mem_cache_negative_ttl),
+        cfg.load_debug_enabled,
+        cfg.cache_wait_warn_ms,
     ));
     let service = Arc::new(AppSettingsService::new(
         cache,
@@ -99,6 +101,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.log_slow_ms,
         cfg.log_sample_rate,
         cfg.log_table_enabled,
+        cfg.load_debug_enabled,
+        cfg.wait_warn_ms,
     ));
 
     let app_state = AppState { service };
